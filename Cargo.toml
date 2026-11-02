@@ -1,0 +1,7 @@
+[package]
+name = "vanta-alloc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# ZERO DEPENDENCIES
