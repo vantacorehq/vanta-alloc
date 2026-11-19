@@ -4,22 +4,27 @@
 
 # VANTA-ALLOC
 
-**ZERO-DEPENDENCY CUSTOM MEMORY ALLOCATOR.**
+**ZERO-DEPENDENCY BUMP ALLOCATOR.**
 
 ## Overview
 
-The standard system `malloc` is a general-purpose allocator designed to handle a massive variety of allocation patterns. In high-performance systems (like HFT engines or real-time data pipelines), the overhead of system calls and lock contention in `malloc` is unacceptable.
+`VANTA-ALLOC` is a global bump allocator. `BumpAllocator::new` maps one region with `mmap` on first use and serves allocations by advancing an atomic cursor. Individual `deallocate` of a pointer inside that region does not rewind the cursor. If the region cannot satisfy a layout, `try_alloc` returns `Err(())` and the `GlobalAlloc` impl falls back to the system allocator.
 
-**VANTA-ALLOC** is a custom global memory allocator written in pure Rust. It replaces the standard library allocator with a high-performance, lock-free **Bump Allocator** (Arena Allocator).
+The release binary prints the cursor before and after it builds two `Vec`s, the bump-allocation counter, and the mapped base address.
 
-## Architecture
+## Behavior
 
-1. **mmap Direct Access:** Bypasses the standard C library and requests memory directly from the Linux kernel via the `mmap` syscall.
-2. **Lock-Free Allocation:** Uses atomic CAS (Compare-And-Swap) operations to manage the heap offset, allowing multiple threads to allocate memory without locking.
-3. **Bump Allocation:** Simply increments a pointer to allocate memory. Extremely fast (O(1) allocations).
+1. **Mapped region:** the global allocator requests its bytes with `mmap`.
+2. **Bump allocation:** compare-and-swap reserves an aligned span and returns a pointer into the region.
+3. **No individual reclaim:** `deallocate` of an in-region pointer leaves the cursor where it is.
+4. **Exhaustion:** `try_alloc` fails when the cursor would pass the end of the region.
+
+Unit tests construct the allocator over a caller-provided buffer. They do not call `mmap`.
 
 ## Build & Run
 
 ```bash
+cargo test
 cargo build --release
 ./target/release/vanta-alloc
+```

@@ -1,120 +1,62 @@
-// VANTA-ALLOC - Custom Global Memory Allocator
+// VANTA-ALLOC - bump allocator backed by one mmap region.
 // Compile: cargo build --release
 // Run: ./target/release/vanta-alloc
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::os::raw::c_void;
+use vanta_alloc::BumpAllocator;
 
-// Constants for memory mapping
-const PAGE_SIZE: usize = 4096;
 const HEAP_SIZE: usize = 1024 * 1024 * 16; // 16 MB heap for demonstration
 
-// FFI bindings to libc mmap
-extern "C" {
-    fn mmap(addr: *mut c_void, length: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut c_void;
-}
-
-const PROT_READ: i32 = 1;
-const PROT_WRITE: i32 = 2;
-const MAP_PRIVATE: i32 = 0x02;
-const MAP_ANONYMOUS: i32 = 0x20;
-
-// Bump Allocator Structure
-struct BumpAllocator {
-    offset: AtomicUsize,
-    start: AtomicUsize, // We store the pointer as usize to satisfy Send/Sync
-}
-
-unsafe impl Sync for BumpAllocator {}
-
-impl BumpAllocator {
-    const fn new() -> Self {
-        BumpAllocator {
-            offset: AtomicUsize::new(0),
-            start: AtomicUsize::new(0),
-        }
-    }
-
-    fn init(&self) {
-        if self.start.load(Ordering::Relaxed) == 0 {
-            unsafe {
-                let ptr = mmap(
-                    std::ptr::null_mut(),
-                    HEAP_SIZE,
-                    PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS,
-                    -1,
-                    0,
-                );
-                if ptr == usize::MAX as *mut c_void {
-                    panic!("mmap failed to allocate heap");
-                }
-                self.start.store(ptr as usize, Ordering::Relaxed);
-            }
-        }
-    }
-}
-
-unsafe impl GlobalAlloc for BumpAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        self.init();
-        
-        let mut current_offset = self.offset.load(Ordering::Relaxed);
-        loop {
-            // Align the current offset based on the requested layout alignment
-            let aligned_offset = (current_offset + layout.align() - 1) & !(layout.align() - 1);
-            let new_offset = aligned_offset + layout.size();
-
-            if new_offset > HEAP_SIZE {
-                // Heap exhausted, fallback to system allocator
-                return System.alloc(layout);
-            }
-
-            // Try to atomically update the offset
-            match self.offset.compare_exchange_weak(
-                current_offset,
-                new_offset,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => {
-                    let start_ptr = self.start.load(Ordering::Relaxed);
-                    return (start_ptr + aligned_offset) as *mut u8;
-                }
-                Err(actual) => {
-                    current_offset = actual;
-                }
-            }
-        }
-    }
-
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {
-        // Bump allocators typically don't free individual blocks.
-        // Memory is reclaimed when the entire arena is dropped.
-        // For this PoC, we do nothing, leaving memory to be freed by the OS on exit.
-    }
-}
-
-// Declare our custom allocator as the global allocator
 #[global_allocator]
-static ALLOCATOR: BumpAllocator = BumpAllocator::new();
+static ALLOCATOR: BumpAllocator = BumpAllocator::new(HEAP_SIZE);
 
 fn main() {
     println!("[VANTA-ALLOC] Initializing custom global allocator...");
-    
-    // Allocate some vectors to trigger the custom allocator
+
+    let cursor_before = ALLOCATOR.cursor();
     let mut vec1 = Vec::with_capacity(1000);
     for i in 0..1000 {
         vec1.push(i);
     }
-    
+    let cursor_after_vec1 = ALLOCATOR.cursor();
+
     let mut vec2 = Vec::with_capacity(5000);
     for i in 0..5000 {
         vec2.push(i * 2);
     }
+    let cursor_after_vec2 = ALLOCATOR.cursor();
 
-    println!("[VANTA-ALLOC] Allocated {} bytes for Vec 1", vec1.capacity());
-    println!("[VANTA-ALLOC] Allocated {} bytes for Vec 2", vec2.capacity());
-    println!("[SUCCESS] Execution complete. Custom mmap allocator bypassed standard system malloc.");
+    println!(
+        "[VANTA-ALLOC] Vec 1 len {} capacity {} ({} bytes of i32 slots)",
+        vec1.len(),
+        vec1.capacity(),
+        vec1.capacity() * std::mem::size_of_val(&vec1[0])
+    );
+    println!(
+        "[VANTA-ALLOC] Vec 2 len {} capacity {} ({} bytes of i32 slots)",
+        vec2.len(),
+        vec2.capacity(),
+        vec2.capacity() * std::mem::size_of_val(&vec2[0])
+    );
+    println!(
+        "[VANTA-ALLOC] Arena cursor {cursor_before} -> {cursor_after_vec1} -> {cursor_after_vec2} / {} bytes",
+        ALLOCATOR.capacity()
+    );
+    println!(
+        "[VANTA-ALLOC] Bump allocations served from the arena: {}",
+        ALLOCATOR.bump_allocs()
+    );
+    println!(
+        "[VANTA-ALLOC] Mapped region base: {:#x}",
+        ALLOCATOR.region_start()
+    );
+    if ALLOCATOR.bump_allocs() > 0
+        && ALLOCATOR.region_start() != 0
+        && cursor_after_vec2 > cursor_before
+    {
+        println!(
+            "[VANTA-ALLOC] Cursor advanced while the Vecs were built; those bump allocations came from the mmap region."
+        );
+    }
+    println!("[SUCCESS] Execution complete.");
+    std::hint::black_box((vec1, vec2));
 }
